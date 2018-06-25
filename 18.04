@@ -1,1 +1,7 @@
-
+1.中文输入法
+  1）点击设置，进入设置界面
+  2）在语言选项点击安装语言管理（Manage Installed Language），初次使用需要安装
+  3）添加汉语包，点击Install/Remove Languages，在弹出的窗口勾选Chinese Simplified，点击应用Apply即可继续安装汉语包，Keyboard Input method system仍选IBus。
+  4）汉语包安装完成后回到语言设置界面添加输入选项
+     选择Chinese（若没有点击Other在里面找或者搜索），此时可以看到相关的选项（pinyin，五笔），选择Intlligent Pinyin即可
+  5）如果不习惯语言切换的方式可以在Devices》Keyboard更改快捷方式，将原本默认的win+空格改为ctl+空格
