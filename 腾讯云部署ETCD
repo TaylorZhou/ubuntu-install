@@ -1,0 +1,225 @@
+一、 首先声明，跟一般物理机或虚拟机不同点在于：
+启动命令的配置，etcd --name etcd0 --data-dir /var/lib/etcd/etcd0.etcd --cert-file /etc/etcd/etcdSSL/etcd.pem 
+--key-file /etc/etcd/etcdSSL/etcd-key.pem --peer-cert-file /etc/etcd/etcdSSL/etcd.pem 
+--peer-key-file /etc/etcd/etcdSSL/etcd-key.pem --trusted-ca-file /etc/etcd/etcdSSL/etcd-root-ca.pem 
+--peer-trusted-ca-file /etc/etcd/etcdSSL/etcd-root-ca.pem --initial-advertise-peer-urls https://118.24.41.49:2380 
+--listen-peer-urls https://0.0.0.0:2380 --listen-client-urls https://0.0.0.0:2379 
+--advertise-client-urls https://0.0.0.0:2379 --initial-cluster-token etcd-cluster 
+--initial-cluster etcd0=https://118.24.41.49:2380,etcd1=https://118.25.26.82:2380,etcd2=https://111.231.72.231:2380 
+--initial-cluster-state new --force-new-cluster
+
+1.--listen-peer-urls与listen-client-urls 不能配置为外网IP,笔者配置为0.0.0.0（腾讯云服务器外网IP于内网IP之间是通过一对一的NAT实现的，内网IP配置在网卡上，外网IP配置在网关上。
+如需绑定IP的场景，直接绑定内网IP，即可转发到外网IP上）。
+
+2. --initial-cluster 集群中所有的机器上 都必须一样，如果不一样 将会出现rafthttp: request cluster ID mismatch (got 2608b548238ae950 want 119629157b1f42f5)
+这种类型的报错
+
+3.initial-advertise-peer-urls配置为--initial-cluster中含有的元素
+
+这里顺便说下物理机和云主机都会出现的坑
+1.权限问题
+由于etcd幽默时etcd用户启动，故其他用户可能不具有对应的权限，
+ chown -R etcd:etcd /etc/etcd/etcdSSL/  //存放证书的目录
+ chmod -R 755 /etc/etcd/    etcd配置文件的目录
+ 以及--data-dir的权限问题，会导致systemctl方式启动失败
+ chown etcd:etcd -R --data-dir对于的目录
+ 
+ 2.使用systemctl start etcd 启动时，需集群中的主机同时启动，不然会出现卡顿现象
+ 
+ 二、 常规集群安装
+ 
+  (1)、环境准备
+环境总共 3 腾讯云服务器，系统为centos7，，在分发证书等阶段将在另外一台主机上执行
+
+IP			            etcd节点name
+118.24.41.49		      etcd0
+118.25.26.82		      etcd1
+111.231.72.231		    etcd2
+由于 Etcd 和 Kubernetes 全部采用 TLS 通讯，所以先要生成 TLS 证书，证书生成工具采用 cfssl
+
+(2)、证书相关处理
+
+1、证书说明
+证书名称	           配置文件	                            用途
+etcd-root-ca.pem	etcd-root-ca-csr.json	etcd              根 CA 证书
+etcd.pem	        etcd-gencert.json、etcd-csr.json	etcd    集群证书
+  1、CFSSL 工具安装
+wget https://pkg.cfssl.org/R1.2/cfssl_linux-amd64 
+wget https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64 
+wget https://pkg.cfssl.org/R1.2/cfssl-certinfo_linux-amd64
+chmod +x cfssl*
+将这三个二进制可执行文件，修改名称复制到/usr/local/bin/下
+cp -v cfssl_linux-amd64 /usr/local/bin/cfssl
+cp -v cfssljson_linux-amd64 /usr/local/bin/cfssljson
+cp -v cfssl-certinfo_linux-amd64 /usr/local/bin/cfssl-certinfo
+ls /usr/local/bin/cfssl*
+
+
+Etcd 证书生成所需配置文件如下:
+vi etcd-root-ca-csr.json
+{
+   "key": {
+     "algo": "rsa",
+     "size": 4096
+   },
+   "names": [
+     {
+       "O": "etcd",
+       "OU": "etcd Security",
+       "L": "Beijing",
+       "ST": "Beijing",
+       "C": "CN"
+     }
+   ],
+   "CN": "etcd-root-ca"
+}
+
+vi etcd-gencert.json
+{
+  "signing": {
+    "default": {
+        "usages": [
+          "signing",
+          "key encipherment",
+          "server auth",
+          "client auth"
+        ],
+        "expiry": "87600h"
+    }
+  }
+}
+vi etcd-csr.json
+{
+  "key": {
+    "algo": "rsa",
+    "size": 4096
+  },
+  "names": [
+    {
+      "O": "etcd",
+      "OU": "etcd Security",
+      "L": "Beijing",
+      "ST": "Beijing",
+      "C": "CN"
+    }
+  ],
+  "CN": "etcd",
+  "hosts": [
+    "127.0.0.1",
+    "localhost",
+    "118.24.41.49",
+    "118.25.26.82",
+    "111.231.72.231",
+    "master",
+    "node1",
+    "node2"
+  ]
+}
+最后生成 Etcd 证书
+cfssl gencert --initca=true etcd-root-ca-csr.json | cfssljson --bare etcd-root-ca
+cfssl gencert --ca etcd-root-ca.pem --ca-key etcd-root-ca-key.pem --config etcd-gencert.json etcd-csr.json | cfssljson --bare etcd
+
+三、部署 HA ETCD
+安装前准备
+
+关闭 selinux, setenforce 0
+
+关闭防火墙， systemctl stop firewalld; iptables -F
+
+ntpdate 时间同步
+
+ntpdate time1.aliyun.com
+
+1、安装 Etcd
+笔者时通过在，每台机器上yum install -y etcd的方式安装（可用rpm的方式 scp到其他机器上）
+2、分发证书
+I="118.24.41.49 118.25.26.82 111.231.72.231"
+
+for IP in $I; do
+    ssh root@$IP mkdir /etc/etcd/etcdSSL/
+    scp *.pem root@$IP:/etc/etcd/etcdSSL/
+    ssh root@$IP chown -R etcd:etcd /etc/etcd/etcdSSL/
+    ssh root@$IP chmod -R 755 /etc/etcd/
+done
+
+3、修改配置
+yum 安装好以后直接修改 /etc/etcd/etcd.conf 配置文件即可，其中单个节点配置如下(其他节点只是名字和 IP 不同)
+
+#[Member]
+#ETCD_CORS=""
+ETCD_DATA_DIR="/var/lib/etcd/etcd0.etcd"
+ETCD_WAL_DIR="/var/lib/etcd/wal"
+ETCD_LISTEN_PEER_URLS="https://0.0.0.0:2380"
+ETCD_LISTEN_CLIENT_URLS="https://0.0.0.0:2379"
+#ETCD_MAX_SNAPSHOTS="5"
+#ETCD_MAX_WALS="5"
+ETCD_NAME="etcd0"
+#ETCD_SNAPSHOT_COUNT="100"
+#ETCD_HEARTBEAT_INTERVAL="100"
+#ETCD_ELECTION_TIMEOUT="1000"
+#ETCD_QUOTA_BACKEND_BYTES="0"
+#ETCD_MAX_REQUEST_BYTES="1572864"
+#ETCD_GRPC_KEEPALIVE_MIN_TIME="5s"
+#ETCD_GRPC_KEEPALIVE_INTERVAL="2h0m0s"
+#ETCD_GRPC_KEEPALIVE_TIMEOUT="20s"
+#
+#[Clustering]
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://0.0.0.0:2380"
+ETCD_ADVERTISE_CLIENT_URLS="https://0.0.0.0:2379"
+#ETCD_DISCOVERY=""
+#ETCD_DISCOVERY_FALLBACK="proxy"
+#ETCD_DISCOVERY_PROXY=""
+#ETCD_DISCOVERY_SRV=""
+ETCD_INITIAL_CLUSTER="etcd0=https://0.0.0.0:2380,etcd1=https://118.25.26.82:2380
+,etcd2=https://111.231.72.231:2380"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+ETCD_INITIAL_CLUSTER_STATE="new"
+#ETCD_STRICT_RECONFIG_CHECK="true"
+#ETCD_ENABLE_V2="true"
+
+#[Security]
+ETCD_CERT_FILE="/etc/etcd/etcdSSL/etcd.pem"
+ETCD_KEY_FILE="/etc/etcd/etcdSSL/etcd-key.pem"
+#ETCD_CLIENT_CERT_AUTH="true"
+ETCD_TRUSTED_CA_FILE="/etc/etcd/etcdSSL/etcd-root-ca.pem"
+#ETCD_AUTO_TLS="true"
+ETCD_PEER_CERT_FILE="/etc/etcd/etcdSSL/etcd.pem"
+ETCD_PEER_KEY_FILE="/etc/etcd/etcdSSL/etcd-key.pem"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+ETCD_PEER_TRUSTED_CA_FILE="/etc/etcd/etcdSSL/etcd-root-ca.pem"
+#ETCD_PEER_AUTO_TLS="true"
+其他节点要修改的地方：
+ETCD_NAME
+ETCD_LISTEN_PEER_URLS 
+ETCD_LISTEN_CLIENT_URLS
+ETCD_INITIAL_ADVERTISE_PEER_URLS
+ETCD_ADVERTISE_CLIENT_URLS
+
+笔者通过直接修改/usr/lib/systemd/system/etcd.service
+
+ExecStart=/usr/bin/etcd --name etcd0 --data-dir /var/lib/etcd/etcd0.etcd --cert-file /etc/etcd/etcdSSL/etcd.pem 
+--key-file /etc/etcd/etcdSSL/etcd-key.pem --peer-cert-file /etc/etcd/etcdSSL/etcd.pem 
+--peer-key-file /etc/etcd/etcdSSL/etcd-key.pem --trusted-ca-file /etc/etcd/etcdSSL/etcd-root-ca.pem 
+--peer-trusted-ca-file /etc/etcd/etcdSSL/etcd-root-ca.pem --initial-advertise-peer-urls https://118.24.41.49:2380 
+--listen-peer-urls https://0.0.0.0:2380 --listen-client-urls https://0.0.0.0:2379 
+--advertise-client-urls https://0.0.0.0:2379 --initial-cluster-token etcd-cluster 
+--initial-cluster etcd0=https://118.24.41.49:2380,etcd1=https://118.25.26.82:2380,etcd2=https://111.231.72.231:2380 
+--initial-cluster-state new --force-new-cluster
+
+4、启动验证
+配置修改后在每个节点进行启动即可，注意，Etcd 各个节点间必须保证时钟同步，否则会造成启动失败等错误
+systemctl daemon-reload
+systemctl start etcd
+systemctl enable etcd
+启动成功后验证节点状态
+
+
+
+
+
+
+
+
+
+
+
